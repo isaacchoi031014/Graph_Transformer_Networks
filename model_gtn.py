@@ -4,6 +4,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import math
 from gcn import GCNConv
+from gat import GATConv
 from torch_scatter import scatter_add
 import torch_sparse
 
@@ -30,7 +31,7 @@ class GTN(nn.Module):
             self.m = nn.Sigmoid()
             self.loss = nn.BCELoss()
         else:
-            self.loss = nn.CrossEntropyLoss()
+            self.loss = nn.CrossEntropyLoss() # mostly uses this
         self.gcn = GCNConv(in_channels=self.w_in, out_channels=w_out, args=args)
         self.linear = nn.Linear(self.w_out*self.num_channels, self.num_class)
 
@@ -77,6 +78,134 @@ class GTN(nn.Module):
                 X_tmp = F.relu(self.gcn(X,edge_index=edge_index.detach(), edge_weight=edge_weight))
                 X_ = torch.cat((X_,X_tmp), dim=1)
 
+        y = self.linear(X_[target_x])
+        if eval:
+            return y
+        else:
+            if self.args.dataset == 'PPI':
+                loss = self.loss(self.m(y), target)
+            else:
+                loss = self.loss(y, target)
+        return loss, y, Ws
+
+
+class GTN_GAT(nn.Module):
+    """
+    GTN_GAT is identical to GTN in every way EXCEPT the final node
+    aggregation step:
+
+        GTN     -> GCNConv (fixed degree-normalized neighbor average)
+        GTN_GAT -> GATConv (learned attention-weighted neighbor average)
+
+    The meta-path graph learning part (GTLayer / GTConv / normalization())
+    is copied UNCHANGED from GTN, so GTN_GAT searches over exactly the
+    same space of learned meta-path graphs as the original GTN. Only the
+    "how do we read node features off of that learned graph" step differs.
+    """
+
+    def __init__(self, num_edge, num_channels, w_in, w_out, num_class, num_nodes, num_layers, args=None):
+        super(GTN_GAT, self).__init__()
+        self.num_edge = num_edge
+        self.num_channels = num_channels
+        self.num_nodes = num_nodes
+        self.w_in = w_in
+        self.w_out = w_out
+        self.num_class = num_class
+        self.num_layers = num_layers
+        self.args = args
+        layers = []
+        for i in range(num_layers):
+            if i == 0:
+                # GTLayer learns how to combine raw edge types into a meta-path graph
+                layers.append(GTLayer(num_edge, num_channels, num_nodes, first=True))
+            else:
+                layers.append(GTLayer(num_edge, num_channels, num_nodes, first=False))
+        self.layers = nn.ModuleList(layers)
+        if args.dataset in ["PPI", "BOOK", "MUSIC"]:
+            self.m = nn.Sigmoid()
+            self.loss = nn.BCELoss()
+        else:
+            self.loss = nn.CrossEntropyLoss()
+        # ---- This is the ONLY change vs. GTN: GAT-style attention ----
+        # ---- aggregation instead of GCN-style normalized aggregation ----
+        # heads > 1 uses multiple independent attention heads, averaged
+        # together inside GATConv (see gat.py), so w_out is unaffected.
+        self.gat = GATConv(in_channels=self.w_in, out_channels=w_out,
+                            heads=args.heads, dropout=args.dropout, args=args)
+        # optional residual connection: projects the ORIGINAL input features X
+        # (not the GAT output) into w_out dims, so it can be added on top of
+        # the GAT output. Only used when args.residual is True (see forward()).
+        self.residual_proj = nn.Linear(self.w_in, self.w_out)
+        # learnable scale for the residual, starts small (0.1) so early
+        # training is dominated by the GAT output; the model can grow (or
+        # shrink) this weight on its own as it learns how useful the
+        # residual shortcut is.
+        self.res_alpha = nn.Parameter(torch.tensor(0.1))
+        self.linear = nn.Linear(self.w_out*self.num_channels, self.num_class)
+
+    def normalization(self, H, num_nodes):
+        # Identical to GTN.normalization(): degree-normalizes each
+        # learned meta-path graph before it is handed to the aggregator.
+        norm_H = []
+        for i in range(self.num_channels):
+            edge, value=H[i]
+            deg_row, deg_col = self.norm(edge.detach(), num_nodes, value)
+            value = (deg_row) * value
+            norm_H.append((edge, value))
+        return norm_H
+
+    def norm(self, edge_index, num_nodes, edge_weight, improved=False, dtype=None):
+        # Identical to GTN.norm().
+        if edge_weight is None:
+            edge_weight = torch.ones((edge_index.size(1), ),
+                                    dtype=dtype,
+                                    device=edge_index.device)
+        edge_weight = edge_weight.view(-1)
+        assert edge_weight.size(0) == edge_index.size(1)
+        row, col = edge_index
+        deg = scatter_add(edge_weight.clone(), row, dim=0, dim_size=num_nodes)
+        deg_inv_sqrt = deg.pow(-1)
+        deg_inv_sqrt[deg_inv_sqrt == float('inf')] = 0
+
+        return deg_inv_sqrt[row], deg_inv_sqrt[col]
+
+    def forward(self, A, X, target_x, target, num_nodes=None, eval=False, node_labels=None):
+        if num_nodes is None:
+            num_nodes = self.num_nodes
+        Ws = []
+        # ---- Step 1: learn meta-path graphs. SAME as GTN, untouched. ----
+        for i in range(self.num_layers):
+            if i == 0:
+                H, W = self.layers[i](A, num_nodes, eval=eval)
+            else:
+                H, W = self.layers[i](A, num_nodes, H, eval=eval)
+            H = self.normalization(H, num_nodes)
+            Ws.append(W)
+        # ---- Step 2: aggregate node features on each learned graph. ----
+        # ---- This is the only part that differs from GTN: GAT instead of GCN. ----
+        for i in range(self.num_channels):
+            edge_index, edge_weight = H[i][0], H[i][1]
+            # gat_out: [num_nodes, w_out]
+            gat_out = self.gat(X, edge_index=edge_index.detach(), edge_weight=edge_weight)
+            if self.args.residual:
+                # residual: [num_nodes, w_out] -- projects the RAW input
+                # features X (skipping the learned meta-path graph entirely)
+                # so gradients/information have a direct shortcut path, on
+                # top of whatever the GAT aggregation learned. Scaled by
+                # the learnable self.res_alpha so the model controls how
+                # much of the residual to actually use.
+                residual = self.residual_proj(X)
+                gat_out = gat_out + self.res_alpha * residual
+            if i==0:
+                # X_tmp / X_: [num_nodes, w_out]
+                X_ = F.relu(gat_out)
+            else:
+                X_tmp = F.relu(gat_out)
+                # X_ after cat: [num_nodes, w_out * (i+1)]
+                X_ = torch.cat((X_,X_tmp), dim=1)
+        # after the loop: X_ is [num_nodes, w_out * num_channels]
+
+        # ---- Step 3: classify. SAME as GTN, untouched. ----
         y = self.linear(X_[target_x])
         if eval:
             return y

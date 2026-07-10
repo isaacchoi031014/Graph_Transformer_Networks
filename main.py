@@ -1,14 +1,16 @@
 import torch
 import numpy as np
 import torch.nn as nn
-from model_gtn import GTN
+from model_gtn import GTN, GTN_GAT
 from model_fastgtn import FastGTNs
 import pickle
 import argparse
-from torch_geometric.utils import f1_score, add_self_loops
+from torch_geometric.utils import add_self_loops
 from sklearn.metrics import f1_score as sk_f1_score
 from utils import init_seed, _norm
 import copy
+
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 if __name__ == '__main__':
     init_seed(seed=777)
@@ -33,6 +35,9 @@ if __name__ == '__main__':
                         help='number of runs')
     parser.add_argument("--channel_agg", type=str, default='concat')
     parser.add_argument("--remove_self_loops", action='store_true', help="remove_self_loops")
+    parser.add_argument("--residual", action='store_true', help="enable residual connection in GTN_GAT (no effect on GTN/FastGTN)")
+    parser.add_argument("--heads", type=int, default=1, help="number of attention heads in GTN_GAT's GATConv, averaged together (no effect on GTN/FastGTN)")
+    parser.add_argument("--dropout", type=float, default=0.3, help="feature/attention dropout rate inside GTN_GAT's GATConv (no effect on GTN/FastGTN)")
     # Configurations for FastGTNs
     parser.add_argument("--non_local", action='store_true', help="use non local operations")
     parser.add_argument("--non_local_weight", type=float, default=0, help="weight initialization for non local operations")
@@ -68,37 +73,37 @@ if __name__ == '__main__':
     # build adjacency matrices for each edge type
     A = []
     for i,edge in enumerate(edges):
-        edge_tmp = torch.from_numpy(np.vstack((edge.nonzero()[1], edge.nonzero()[0]))).type(torch.cuda.LongTensor)
-        value_tmp = torch.ones(edge_tmp.shape[1]).type(torch.cuda.FloatTensor)
+        edge_tmp = torch.from_numpy(np.vstack((edge.nonzero()[1], edge.nonzero()[0]))).long().to(device)
+        value_tmp = torch.ones(edge_tmp.shape[1]).float().to(device)
         # normalize each adjacency matrix
         if args.model == 'FastGTN' and args.dataset != 'AIRPORT':
             edge_tmp, value_tmp = add_self_loops(edge_tmp, edge_attr=value_tmp, fill_value=1e-20, num_nodes=num_nodes)
             deg_inv_sqrt, deg_row, deg_col = _norm(edge_tmp.detach(), num_nodes, value_tmp.detach())
             value_tmp = deg_inv_sqrt[deg_row] * value_tmp
         A.append((edge_tmp,value_tmp))
-    edge_tmp = torch.stack((torch.arange(0,num_nodes),torch.arange(0,num_nodes))).type(torch.cuda.LongTensor)
-    value_tmp = torch.ones(num_nodes).type(torch.cuda.FloatTensor)
+    edge_tmp = torch.stack((torch.arange(0,num_nodes),torch.arange(0,num_nodes))).long().to(device)
+    value_tmp = torch.ones(num_nodes).float().to(device)
     A.append((edge_tmp,value_tmp))
-    
-    
+
+
     num_edge_type = len(A)
-    node_features = torch.from_numpy(node_features).type(torch.cuda.FloatTensor)
+    node_features = torch.from_numpy(node_features).float().to(device)
     if args.dataset == 'PPI':
-        train_node = torch.from_numpy(nids[0]).type(torch.cuda.LongTensor)
-        train_target = torch.from_numpy(labels[nids[0]]).type(torch.cuda.FloatTensor)
-        valid_node = torch.from_numpy(nids[1]).type(torch.cuda.LongTensor)
-        valid_target = torch.from_numpy(labels[nids[1]]).type(torch.cuda.FloatTensor)
-        test_node = torch.from_numpy(nids[2]).type(torch.cuda.LongTensor)
-        test_target = torch.from_numpy(labels[nids[2]]).type(torch.cuda.FloatTensor)
+        train_node = torch.from_numpy(nids[0]).long().to(device)
+        train_target = torch.from_numpy(labels[nids[0]]).float().to(device)
+        valid_node = torch.from_numpy(nids[1]).long().to(device)
+        valid_target = torch.from_numpy(labels[nids[1]]).float().to(device)
+        test_node = torch.from_numpy(nids[2]).long().to(device)
+        test_target = torch.from_numpy(labels[nids[2]]).float().to(device)
         num_classes = 121
         is_ppi = True
     else:
-        train_node = torch.from_numpy(np.array(labels[0])[:,0]).type(torch.cuda.LongTensor)
-        train_target = torch.from_numpy(np.array(labels[0])[:,1]).type(torch.cuda.LongTensor)
-        valid_node = torch.from_numpy(np.array(labels[1])[:,0]).type(torch.cuda.LongTensor)
-        valid_target = torch.from_numpy(np.array(labels[1])[:,1]).type(torch.cuda.LongTensor)
-        test_node = torch.from_numpy(np.array(labels[2])[:,0]).type(torch.cuda.LongTensor)
-        test_target = torch.from_numpy(np.array(labels[2])[:,1]).type(torch.cuda.LongTensor)
+        train_node = torch.from_numpy(np.array(labels[0])[:,0]).long().to(device)
+        train_target = torch.from_numpy(np.array(labels[0])[:,1]).long().to(device)
+        valid_node = torch.from_numpy(np.array(labels[1])[:,0]).long().to(device)
+        valid_target = torch.from_numpy(np.array(labels[1])[:,1]).long().to(device)
+        test_node = torch.from_numpy(np.array(labels[2])[:,0]).long().to(device)
+        test_target = torch.from_numpy(np.array(labels[2])[:,1]).long().to(device)
         num_classes = np.max([torch.max(train_target).item(), torch.max(valid_target).item(), torch.max(test_target).item()])+1
         is_ppi = False
     final_f1, final_micro_f1 = [], []
@@ -117,7 +122,19 @@ if __name__ == '__main__':
                                 num_class=num_classes,
                                 num_layers=num_layers,
                                 num_nodes=num_nodes,
-                                args=args)        
+                                args=args)
+        elif args.model == 'GTN_GAT':
+            # Same meta-path-graph learning as GTN, but GAT-style attention
+            # aggregation instead of GCN-style aggregation. Same constructor
+            # arguments as GTN so it's a drop-in alternative.
+            model = GTN_GAT(num_edge=len(A),
+                                num_channels=num_channels,
+                                w_in = node_features.shape[1],
+                                w_out = node_dim,
+                                num_class=num_classes,
+                                num_layers=num_layers,
+                                num_nodes=num_nodes,
+                                args=args)
         elif args.model == 'FastGTN':
             if args.pre_train and l == 1:
                 pre_trained_fastGTNs = []
@@ -134,9 +151,9 @@ if __name__ == '__main__':
                 for layer in range(args.num_FastGTN_layers):
                     model.fastGTNs[layer].layers = pre_trained_fastGTNs[layer]
 
+        model.to(device)
         optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
 
-        model.cuda()
         if args.dataset == 'PPI':
             loss = nn.BCELoss()
         else:
@@ -163,7 +180,11 @@ if __name__ == '__main__':
                 train_f1 = 0.0
                 sk_train_f1 = sk_f1_score(train_target.detach().cpu().numpy(), y_train.numpy(), average='micro')
             else:
-                train_f1 = torch.mean(f1_score(torch.argmax(y_train.detach(),dim=1), train_target, num_classes=num_classes)).cpu().numpy()
+                train_f1 = sk_f1_score(
+                    train_target.detach().cpu().numpy(),
+                    torch.argmax(y_train.detach(), dim=1).cpu().numpy(),
+                    average='macro'
+                )
                 sk_train_f1 = sk_f1_score(train_target.detach().cpu(), np.argmax(y_train.detach().cpu(), axis=1), average='micro')
             # print(W)
             # print('Train - Loss: {}, Macro_F1: {}, Micro_F1: {}'.format(loss.detach().cpu().numpy(), train_f1, sk_train_f1))
@@ -182,7 +203,11 @@ if __name__ == '__main__':
                     y_valid = (y_valid > 0).detach().float().cpu()
                     sk_val_f1 = sk_f1_score(valid_target.detach().cpu().numpy(), y_valid.numpy(), average='micro')
                 else:
-                    val_f1 = torch.mean(f1_score(torch.argmax(y_valid,dim=1), valid_target, num_classes=num_classes)).cpu().numpy()
+                    val_f1 = sk_f1_score(
+                        valid_target.detach().cpu().numpy(),
+                        torch.argmax(y_valid.detach(), dim=1).cpu().numpy(),
+                        average='macro'
+                    )
                     sk_val_f1 = sk_f1_score(valid_target.detach().cpu(), np.argmax(y_valid.detach().cpu(), axis=1), average='micro')
                 # print('Valid - Loss: {}, Macro_F1: {}, Micro_F1: {}'.format(val_loss.detach().cpu().numpy(), val_f1, sk_val_f1))
 
@@ -195,7 +220,11 @@ if __name__ == '__main__':
                     y_test = (y_test > 0).detach().float().cpu()
                     sk_test_f1 = sk_f1_score(test_target.detach().cpu().numpy(), y_test.numpy(), average='micro')
                 else:
-                    test_f1 = torch.mean(f1_score(torch.argmax(y_test,dim=1), test_target, num_classes=num_classes)).cpu().numpy()
+                    test_f1 = sk_f1_score(
+                        test_target.detach().cpu().numpy(),
+                        torch.argmax(y_test.detach(), dim=1).cpu().numpy(),
+                        average='macro'
+                    )
                     sk_test_f1 = sk_f1_score(test_target.detach().cpu(), np.argmax(y_test.detach().cpu(), axis=1), average='micro')
                 # print('Test - Loss: {}, Macro_F1: {}, Micro_F1:{} \n'.format(test_loss.detach().cpu().numpy(), test_f1, sk_test_f1))
             if sk_val_f1 > best_micro_val_f1:
