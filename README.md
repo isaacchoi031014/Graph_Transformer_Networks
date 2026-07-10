@@ -52,16 +52,16 @@ $$
 
 **Attention coefficients.** For each edge $j \to i$ in the (self-loop-augmented) meta-path graph $\tilde{A}^{(c)}$:
 
-$$
+```math
 \begin{aligned}
 e_{ij}^{(h)}
-&= \mathrm{LeakyReLU}\Big(
+&= \operatorname{LeakyReLU}\Big(
 (a_{\mathrm{src}}^{(h)})^\top z_j^{(h)} \\
 &\qquad\qquad
 + (a_{\mathrm{dst}}^{(h)})^\top z_i^{(h)}
 \Big)
 \end{aligned}
-$$
+```
 
 The learned meta-path edge weight $\tilde{A}^{(c)}_{ij}$ is folded in additively in log-space, so that a near-zero learned weight suppresses attention on that edge (score $\to -\infty$) while a larger learned weight raises it:
 
